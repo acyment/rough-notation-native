@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --prefix .. run build)",
+      "Bash(bun run:*)",
+      "Bash(pkill:*)"
+    ],
+    "deny": []
+  }
+}

@@ -1,32 +1,9 @@
-import { Rect, RoughAnnotationConfig, SVG_NS, FullPadding, BracketType } from './model.js';
-import { ResolvedOptions, OpSet } from 'roughjs/bin/core';
-import { line, rectangle, ellipse, linearPath } from 'roughjs/bin/renderer';
-import { Point } from 'roughjs/bin/geometry';
+import { Rect, RoughAnnotationConfig, FullPadding, BracketType } from './model';
 
-type RoughOptionsType = 'highlight' | 'single' | 'double';
-
-function getOptions(type: RoughOptionsType, seed: number): ResolvedOptions {
-  return {
-    maxRandomnessOffset: 2,
-    roughness: type === 'highlight' ? 3 : 1.5,
-    bowing: 1,
-    stroke: '#000',
-    strokeWidth: 1.5,
-    curveTightness: 0,
-    curveFitting: 0.95,
-    curveStepCount: 9,
-    fillStyle: 'hachure',
-    fillWeight: -1,
-    hachureAngle: -41,
-    hachureGap: -1,
-    dashOffset: -1,
-    dashGap: -1,
-    zigzagOffset: -1,
-    combineNestedSvgPaths: false,
-    disableMultiStroke: type !== 'double',
-    disableMultiStrokeFill: false,
-    seed
-  };
+export interface PathData {
+  d: string;
+  strokeWidth: number;
+  length: number;
 }
 
 function parsePadding(config: RoughAnnotationConfig): FullPadding {
@@ -55,35 +32,219 @@ function parsePadding(config: RoughAnnotationConfig): FullPadding {
   return [5, 5, 5, 5];
 }
 
-export function renderAnnotation(svg: SVGSVGElement, rect: Rect, config: RoughAnnotationConfig, animationGroupDelay: number, animationDuration: number, seed: number) {
-  const opList: OpSet[] = [];
+// More organic line generation that mimics natural hand drawing
+function generateSketchyLine(x1: number, y1: number, x2: number, y2: number, roughness: number = 1, random: () => number): string {
+  const length = Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
+  
+  // Use fewer, irregular segments for more organic feel
+  const baseSegments = Math.max(2, Math.floor(length / 60));
+  const segments: {x: number, y: number}[] = [];
+  
+  // Create irregular segment spacing (more human-like)
+  let accumulatedT = 0;
+  for (let i = 0; i < baseSegments; i++) {
+    if (i === 0) {
+      segments.push({x: x1, y: y1});
+    } else if (i === baseSegments - 1) {
+      segments.push({x: x2, y: y2});
+    } else {
+      // Irregular spacing - some segments closer, some farther
+      const segmentLength = (1 / baseSegments) * (0.7 + 0.6 * random());
+      accumulatedT += segmentLength;
+      accumulatedT = Math.min(accumulatedT, 0.95); // Don't go past near-end
+      
+      const x = x1 + (x2 - x1) * accumulatedT;
+      const y = y1 + (y2 - y1) * accumulatedT;
+      segments.push({x, y});
+    }
+  }
+  
+  // Apply organic roughness to each segment
+  for (let i = 0; i < segments.length; i++) {
+    if (i === 0 || i === segments.length - 1) {
+      // Keep endpoints closer to original with slight variation
+      segments[i].x += (random() - 0.5) * roughness * 0.5;
+      segments[i].y += (random() - 0.5) * roughness * 0.8;
+    } else {
+      // Middle points get more natural variation
+      const variationX = (random() - 0.5) * roughness * (0.6 + 0.8 * random());
+      const variationY = (random() - 0.5) * roughness * (1.2 + 1.0 * random());
+      segments[i].x += variationX;
+      segments[i].y += variationY;
+    }
+  }
+  
+  // Build path with smooth curves between irregular points
+  let path = `M${segments[0].x},${segments[0].y}`;
+  
+  for (let i = 1; i < segments.length; i++) {
+    if (i === 1 && segments.length > 2) {
+      // Use quadratic curve for first segment
+      const cp1x = segments[0].x + (segments[1].x - segments[0].x) * 0.4 + (random() - 0.5) * roughness * 0.8;
+      const cp1y = segments[0].y + (segments[1].y - segments[0].y) * 0.4 + (random() - 0.5) * roughness * 1.2;
+      path += ` Q${cp1x},${cp1y} ${segments[i].x},${segments[i].y}`;
+    } else {
+      // Simple lines with natural variation for the rest
+      path += ` L${segments[i].x},${segments[i].y}`;
+    }
+  }
+  
+  return path;
+}
+
+function generateSketchyRect(x: number, y: number, width: number, height: number, roughness: number = 1, random: () => number): string {
+  const r = roughness;
+  const x1 = x + (random() - 0.5) * r;
+  const y1 = y + (random() - 0.5) * r;
+  const x2 = x + width + (random() - 0.5) * r;
+  const y2 = y + (random() - 0.5) * r;
+  const x3 = x + width + (random() - 0.5) * r;
+  const y3 = y + height + (random() - 0.5) * r;
+  const x4 = x + (random() - 0.5) * r;
+  const y4 = y + height + (random() - 0.5) * r;
+  
+  return `M${x1},${y1} L${x2},${y2} L${x3},${y3} L${x4},${y4} Z`;
+}
+
+function generateSketchyEllipse(cx: number, cy: number, width: number, height: number, roughness: number = 1, random: () => number): string {
+  const rx = width / 2;
+  const ry = height / 2;
+  
+  // Use proper cubic bezier approximation of ellipse
+  let path = '';
+  
+  // Magic number for cubic bezier ellipse approximation
+  const kappa = 0.5522848;
+  const ox = rx * kappa; // control point offset x
+  const oy = ry * kappa; // control point offset y
+  
+  // Define the four segments of the ellipse with control points
+  const segments = [
+    // Top right
+    { start: {x: cx + rx, y: cy}, cp1: {x: cx + rx, y: cy - oy}, cp2: {x: cx + ox, y: cy - ry}, end: {x: cx, y: cy - ry} },
+    // Top left  
+    { start: {x: cx, y: cy - ry}, cp1: {x: cx - ox, y: cy - ry}, cp2: {x: cx - rx, y: cy - oy}, end: {x: cx - rx, y: cy} },
+    // Bottom left
+    { start: {x: cx - rx, y: cy}, cp1: {x: cx - rx, y: cy + oy}, cp2: {x: cx - ox, y: cy + ry}, end: {x: cx, y: cy + ry} },
+    // Bottom right
+    { start: {x: cx, y: cy + ry}, cp1: {x: cx + ox, y: cy + ry}, cp2: {x: cx + rx, y: cy + oy}, end: {x: cx + rx, y: cy} }
+  ];
+  
+  // Apply roughness to each point with more variation
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    const variationFactor = 0.8 + 0.4 * Math.sin(i * Math.PI * 0.7); // Vary roughness around the circle
+    
+    // Add more variation to endpoints for sketchier appearance
+    segment.start.x += (random() - 0.5) * roughness * variationFactor;
+    segment.start.y += (random() - 0.5) * roughness * variationFactor;
+    segment.cp1.x += (random() - 0.5) * roughness * variationFactor * 0.8;
+    segment.cp1.y += (random() - 0.5) * roughness * variationFactor * 0.8;
+    segment.cp2.x += (random() - 0.5) * roughness * variationFactor * 0.8;
+    segment.cp2.y += (random() - 0.5) * roughness * variationFactor * 0.8;
+    segment.end.x += (random() - 0.5) * roughness * variationFactor;
+    segment.end.y += (random() - 0.5) * roughness * variationFactor;
+  }
+  
+  // Build the path
+  path = `M${segments[0].start.x},${segments[0].start.y}`;
+  
+  for (const segment of segments) {
+    path += ` C${segment.cp1.x},${segment.cp1.y} ${segment.cp2.x},${segment.cp2.y} ${segment.end.x},${segment.end.y}`;
+  }
+  
+  return path + ' Z';
+}
+
+// Calculate path length for SVG path
+function calculatePathLength(d: string): number {
+  const commands = d.match(/[MLHVCSQTAZ][^MLHVCSQTAZ]*/g) || [];
+  let totalLength = 0;
+  let currentX = 0;
+  let currentY = 0;
+
+  for (const command of commands) {
+    const type = command[0];
+    const coords = command.slice(1).trim().split(/[\s,]+/).map(Number).filter(n => !isNaN(n));
+
+    switch (type) {
+      case 'M':
+        currentX = coords[0];
+        currentY = coords[1];
+        break;
+      case 'L':
+        if (coords.length >= 2) {
+          const dx = coords[0] - currentX;
+          const dy = coords[1] - currentY;
+          totalLength += Math.sqrt(dx * dx + dy * dy);
+          currentX = coords[0];
+          currentY = coords[1];
+        }
+        break;
+      case 'Q':
+        if (coords.length >= 4) {
+          const dx = coords[2] - currentX;
+          const dy = coords[3] - currentY;
+          totalLength += Math.sqrt(dx * dx + dy * dy) * 1.1;
+          currentX = coords[2];
+          currentY = coords[3];
+        }
+        break;
+      case 'C':
+        if (coords.length >= 6) {
+          const dx = coords[4] - currentX;
+          const dy = coords[5] - currentY;
+          totalLength += Math.sqrt(dx * dx + dy * dy) * 1.2;
+          currentX = coords[4];
+          currentY = coords[5];
+        }
+        break;
+      case 'Z':
+        break;
+    }
+  }
+
+  return totalLength;
+}
+
+// Simple seeded random number generator
+function seededRandom(seed: number): () => number {
+  let state = seed;
+  return () => {
+    state = (state * 1664525 + 1013904223) % 4294967296;
+    return state / 4294967296;
+  };
+}
+
+export function renderAnnotation(rect: Rect, config: RoughAnnotationConfig, seed: number): PathData[] {
+  const paths: PathData[] = [];
   let strokeWidth = config.strokeWidth || 2;
   const padding = parsePadding(config);
-  const animate = (config.animate === undefined) ? true : (!!config.animate);
   const iterations = config.iterations || 2;
   const rtl = config.rtl ? 1 : 0;
-  const o = getOptions('single', seed);
+  const roughness = config.type === 'highlight' ? 6 : (config.type === 'circle' ? 5 : 4);
+  const random = seededRandom(seed);
 
   switch (config.type) {
     case 'underline': {
       const y = rect.y + rect.h + padding[2];
       for (let i = rtl; i < iterations + rtl; i++) {
-        if (i % 2) {
-          opList.push(line(rect.x + rect.w, y, rect.x, y, o));
-        } else {
-          opList.push(line(rect.x, y, rect.x + rect.w, y, o));
-        }
+        const d = i % 2
+          ? generateSketchyLine(rect.x + rect.w, y, rect.x, y, roughness, random)
+          : generateSketchyLine(rect.x, y, rect.x + rect.w, y, roughness, random);
+        
+        paths.push({ d, strokeWidth, length: calculatePathLength(d) });
       }
       break;
     }
     case 'strike-through': {
       const y = rect.y + (rect.h / 2);
       for (let i = rtl; i < iterations + rtl; i++) {
-        if (i % 2) {
-          opList.push(line(rect.x + rect.w, y, rect.x, y, o));
-        } else {
-          opList.push(line(rect.x, y, rect.x + rect.w, y, o));
-        }
+        const d = i % 2
+          ? generateSketchyLine(rect.x + rect.w, y, rect.x, y, roughness, random)
+          : generateSketchyLine(rect.x, y, rect.x + rect.w, y, roughness, random);
+        
+        paths.push({ d, strokeWidth, length: calculatePathLength(d) });
       }
       break;
     }
@@ -92,8 +253,10 @@ export function renderAnnotation(svg: SVGSVGElement, rect: Rect, config: RoughAn
       const y = rect.y - padding[0];
       const width = rect.w + (padding[1] + padding[3]);
       const height = rect.h + (padding[0] + padding[2]);
+      
       for (let i = 0; i < iterations; i++) {
-        opList.push(rectangle(x, y, width, height, o));
+        const d = generateSketchyRect(x, y, width, height, roughness, random);
+        paths.push({ d, strokeWidth, length: calculatePathLength(d) });
       }
       break;
     }
@@ -103,44 +266,25 @@ export function renderAnnotation(svg: SVGSVGElement, rect: Rect, config: RoughAn
       const rx = rect.x + rect.w + padding[1] * 2;
       const ty = rect.y - padding[0] * 2;
       const by = rect.y + rect.h + padding[2] * 2;
+      
       for (const br of brackets) {
-        let points: Point[];
+        let d = '';
         switch (br) {
           case 'bottom':
-            points = [
-              [lx, rect.y + rect.h],
-              [lx, by],
-              [rx, by],
-              [rx, rect.y + rect.h]
-            ];
+            d = `M${lx},${rect.y + rect.h} L${lx},${by} L${rx},${by} L${rx},${rect.y + rect.h}`;
             break;
           case 'top':
-            points = [
-              [lx, rect.y],
-              [lx, ty],
-              [rx, ty],
-              [rx, rect.y]
-            ];
+            d = `M${lx},${rect.y} L${lx},${ty} L${rx},${ty} L${rx},${rect.y}`;
             break;
           case 'left':
-            points = [
-              [rect.x, ty],
-              [lx, ty],
-              [lx, by],
-              [rect.x, by]
-            ];
+            d = `M${rect.x},${ty} L${lx},${ty} L${lx},${by} L${rect.x},${by}`;
             break;
           case 'right':
-            points = [
-              [rect.x + rect.w, ty],
-              [rx, ty],
-              [rx, by],
-              [rect.x + rect.w, by]
-            ];
+            d = `M${rect.x + rect.w},${ty} L${rx},${ty} L${rx},${by} L${rect.x + rect.w},${by}`;
             break;
         }
-        if (points) {
-          opList.push(linearPath(points, false, o));
+        if (d) {
+          paths.push({ d, strokeWidth, length: calculatePathLength(d) });
         }
       }
       break;
@@ -150,116 +294,48 @@ export function renderAnnotation(svg: SVGSVGElement, rect: Rect, config: RoughAn
       const y = rect.y;
       const x2 = x + rect.w;
       const y2 = y + rect.h;
+      
       for (let i = rtl; i < iterations + rtl; i++) {
-        if (i % 2) {
-          opList.push(line(x2, y2, x, y, o));
-        } else {
-          opList.push(line(x, y, x2, y2, o));
-        }
+        const d1 = i % 2
+          ? generateSketchyLine(x2, y2, x, y, roughness, random)
+          : generateSketchyLine(x, y, x2, y2, roughness, random);
+        paths.push({ d: d1, strokeWidth, length: calculatePathLength(d1) });
       }
+      
       for (let i = rtl; i < iterations + rtl; i++) {
-        if (i % 2) {
-          opList.push(line(x, y2, x2, y, o));
-        } else {
-          opList.push(line(x2, y, x, y2, o));
-        }
+        const d2 = i % 2
+          ? generateSketchyLine(x, y2, x2, y, roughness, random)
+          : generateSketchyLine(x2, y, x, y2, roughness, random);
+        paths.push({ d: d2, strokeWidth, length: calculatePathLength(d2) });
       }
       break;
     }
     case 'circle': {
-      const doubleO = getOptions('double', seed);
       const width = rect.w + (padding[1] + padding[3]);
       const height = rect.h + (padding[0] + padding[2]);
       const x = rect.x - padding[3] + (width / 2);
       const y = rect.y - padding[0] + (height / 2);
-      const fullItr = Math.floor(iterations / 2);
-      const singleItr = iterations - (fullItr * 2);
-      for (let i = 0; i < fullItr; i++) {
-        opList.push(ellipse(x, y, width, height, doubleO));
-      }
-      for (let i = 0; i < singleItr; i++) {
-        opList.push(ellipse(x, y, width, height, o));
+      
+      for (let i = 0; i < iterations; i++) {
+        const d = generateSketchyEllipse(x, y, width, height, roughness, random);
+        paths.push({ d, strokeWidth, length: calculatePathLength(d) });
       }
       break;
     }
     case 'highlight': {
-      const o = getOptions('highlight', seed);
       strokeWidth = rect.h * 0.95;
       const y = rect.y + (rect.h / 2);
+      
       for (let i = rtl; i < iterations + rtl; i++) {
-        if (i % 2) {
-          opList.push(line(rect.x + rect.w, y, rect.x, y, o));
-        } else {
-          opList.push(line(rect.x, y, rect.x + rect.w, y, o));
-        }
+        const d = i % 2
+          ? generateSketchyLine(rect.x + rect.w, y, rect.x, y, roughness, random)
+          : generateSketchyLine(rect.x, y, rect.x + rect.w, y, roughness, random);
+        
+        paths.push({ d, strokeWidth, length: calculatePathLength(d) });
       }
       break;
     }
   }
 
-  if (opList.length) {
-    const pathStrings = opsToPath(opList);
-    const lengths: number[] = [];
-    const pathElements: SVGPathElement[] = [];
-    let totalLength = 0;
-    const setAttr = (p: SVGPathElement, an: string, av: string) => p.setAttribute(an, av);
-
-    for (const d of pathStrings) {
-      const path = document.createElementNS(SVG_NS, 'path');
-      setAttr(path, 'd', d);
-      setAttr(path, 'fill', 'none');
-      setAttr(path, 'stroke', config.color || 'currentColor');
-      setAttr(path, 'stroke-width', `${strokeWidth}`);
-      if (animate) {
-        const length = path.getTotalLength();
-        lengths.push(length);
-        totalLength += length;
-      }
-      svg.appendChild(path);
-      pathElements.push(path);
-    }
-
-    if (animate) {
-      let durationOffset = 0;
-      for (let i = 0; i < pathElements.length; i++) {
-        const path = pathElements[i];
-        const length = lengths[i];
-        const duration = totalLength ? (animationDuration * (length / totalLength)) : 0;
-        const delay = animationGroupDelay + durationOffset;
-        const style = path.style;
-        style.strokeDashoffset = `${length}`;
-        style.strokeDasharray = `${length}`;
-        style.animation = `rough-notation-dash ${duration}ms ease-out ${delay}ms forwards`;
-        durationOffset += duration;
-      }
-    }
-  }
-}
-
-function opsToPath(opList: OpSet[]): string[] {
-  const paths: string[] = [];
-  for (const drawing of opList) {
-    let path = '';
-    for (const item of drawing.ops) {
-      const data = item.data;
-      switch (item.op) {
-        case 'move':
-          if (path.trim()) {
-            paths.push(path.trim());
-          }
-          path = `M${data[0]} ${data[1]} `;
-          break;
-        case 'bcurveTo':
-          path += `C${data[0]} ${data[1]}, ${data[2]} ${data[3]}, ${data[4]} ${data[5]} `;
-          break;
-        case 'lineTo':
-          path += `L${data[0]} ${data[1]} `;
-          break;
-      }
-    }
-    if (path.trim()) {
-      paths.push(path.trim());
-    }
-  }
   return paths;
 }
